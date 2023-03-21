@@ -52,6 +52,7 @@ import os
 import platform
 import subprocess
 import time
+from typing import Tuple
 import warnings
 from collections import defaultdict
 from copy import deepcopy
@@ -213,7 +214,15 @@ class Exporter:
         # Assign
         self.im = im
         self.model = model
-        self.file = file
+        imgsz_str = f"{self.imgsz[0]}x{self.imgsz[1]}"
+        out_id_str = imgsz_str
+        if self.args.half:
+            out_id_str += "-fp16"
+        if self.args.nms:
+            out_id_str += "-nms"
+
+        self.file = (file.parent / "exported" / file.name).with_stem(file.stem + out_id_str)
+        os.makedirs(str(self.file.parent), exist_ok=True)
         self.output_shape = tuple(y.shape) if isinstance(y, torch.Tensor) else tuple(tuple(x.shape) for x in y)
         self.pretty_name = self.file.stem.replace('yolo', 'YOLO')
         description = f'Ultralytics {self.pretty_name} model ' + f'trained on {Path(self.args.data).name}' \
@@ -384,6 +393,10 @@ class Exporter:
         yaml_save(Path(f) / 'metadata.yaml', self.metadata)  # add metadata.yaml
         return f, None
 
+    def get_model_output_shape(self, model)->Tuple:
+        y = model(self.im)
+        return tuple(y.shape) if isinstance(y, torch.Tensor) else tuple(tuple(x.shape) for x in y)
+
     @try_export
     def _export_coreml(self, prefix=colorstr('CoreML:')):
         # YOLOv8 CoreML export
@@ -424,11 +437,13 @@ class Exporter:
             
         
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
-        f = self.file.with_suffix('.mlmodel')
+        
+        f = self.file.with_suffix(f'.mlmodel')
 
         bias = [0.0, 0.0, 0.0]
         scale = 1 / 255
         classifier_config = None
+        torch_model_outshape = ()
         if self.model.task == 'classify':
             bias = [-x for x in IMAGENET_MEAN]
             scale = 1 / 255 / (sum(IMAGENET_STD) / 3)
@@ -436,9 +451,12 @@ class Exporter:
             model = self.model
         elif self.model.task == 'detect':
             model = iOSDetectModel(self.model, self.im) if self.args.nms else self.model
+            torch_model_outshape = self.get_model_output_shape(model)
         elif self.model.task == 'segment':
             # TODO CoreML Segmentation model pipelining
-            model = self.model
+            model = iOSSegmentModel(self.model, self.im) if self.args.nms else self.model
+            torch_model_outshape = self.get_model_output_shape(model)
+
 
         ts = torch.jit.trace(model.eval(), self.im, strict=False)  # TorchScript model
         ct_model = ct.convert(ts,
@@ -448,9 +466,12 @@ class Exporter:
         if bits < 32:
             ct_model = ct.models.neural_network.quantization_utils.quantize_weights(ct_model, bits, mode)
         if self.args.nms and self.model.task == 'detect':
-            ct_model = self._pipeline_coreml(ct_model)
+            ct_model = self._pipeline_coreml(ct_model, torch_model_outshape, self.args.task)
         if self.model.task == "segment":
-            ct_model = self._add_output_spec_coreml(ct_model, self.args.task, splitted=False)
+            if self.args.nms:
+                ct_model = self._pipeline_coreml(ct_model, torch_model_outshape, self.args.task)
+            else:
+                ct_model = self._add_output_spec_coreml(ct_model, torch_model_outshape, self.args.task, splitted=False)[0]
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m['description']
@@ -753,7 +774,7 @@ class Exporter:
         populator.populate()
         tmp_file.unlink()
 
-    def _add_output_spec_coreml(self, model, task: str, splitted: bool, prefix=colorstr('CoreML add output spec:')):
+    def _add_output_spec_coreml(self, model, torchmodel_outshapes: Tuple, task: str, splitted: bool, prefix=colorstr('CoreML add output spec:')):
         # YOLOv8 CoreML pipeline
         output_descs = {
             ("detect", False): [
@@ -768,14 +789,31 @@ class Exporter:
             [
                 ('detects', '(xywh + Class confidence + 32) × Boxes (see user-defined metadata "classes")'),
                 ('protos', '32 × w/4 × h/4')
+            ],
+            ("segment", True): 
+            [
+                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")'), 
+                ('coordinates', 'Boxes × [x, y, width, height] (relative to image size)'),
+                ('masks', 'Boxes × 32'),
+                ('protos', '32 × w/4 × h/4')
             ]
 
         }
+        output_get_number_of_classes = {
+            ("detect", False):
+                lambda shape: shape[0] - 4,
+            ("detect", True): 
+                lambda shape: shape[1],
+            ("segment", False): 
+                lambda shape: shape[0] - 4 - 32,
+            ("segment", True): 
+                lambda shape: shape[1]
+        }
         
         import coremltools as ct  # noqa
-
+        LOGGER.info(f'{prefix} starting add model specs with coremltools {ct.__version__}...')
+        
         batch_size, ch, h, w = list(self.im.shape)  # BCHW
-
         # Output shapes
         spec = model.get_spec()
         if MACOS:
@@ -787,17 +825,22 @@ class Exporter:
                 _out.type.multiArrayType.shape[:] = out[_out.name].shape
         else:  # linux and windows can not run model.predict(), get sizes from pytorch output y
             for _i in range(0, len(spec.description.output)):
-                print(f"output name: {spec.description.output[_i].name}")
+                LOGGER.info(f"output name: {spec.description.output[_i].name}=>{output_descs[(task, splitted)][_i][0]}, shape: {torchmodel_outshapes[_i]}")
                 ct.utils.rename_feature(
                     spec, 
                     spec.description.output[_i].name,
                     output_descs[(task, splitted)][_i][0]
                 )
-                spec.description.output[_i].type.multiArrayType.shape[:] = self.output_shape[_i]
+                spec.description.output[_i].type.multiArrayType.shape[:] = torchmodel_outshapes[_i]
+                LOGGER.info(f"output name: {output_descs[(task, splitted)][_i][0]} renamed")
 
         # Checks
         names = self.metadata['names']
-        
+        nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
+        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[0].type.multiArrayType.shape)
+        # # na, nc = out0.type.multiArrayType.shape  # number anchors, classes
+        assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
+
         # spec.neuralNetwork.preprocessing[0].featureName = '0'
 
         # Flexible input shapes
@@ -816,74 +859,54 @@ class Exporter:
 
         # Model from spec
         model = ct.models.MLModel(spec)
+        LOGGER.info(f'{prefix} add input and output descrition')
         model.input_description['image'] = 'Input image'
         for _name, _desc in output_descs[(task, splitted)]:
+            LOGGER.info(f'{prefix} add descrption for {_name}')
             model.output_description[_name] = _desc
-        LOGGER.info(f'{prefix} pipeline success')
-        return model
+        LOGGER.info(f'{prefix} success')
+        return model, nx, ny, nc
 
-    def _pipeline_coreml(self, model, prefix=colorstr('CoreML Pipeline:')):
+    def _pipeline_coreml(self, model, torchmodel_outshapes: Tuple, task: str, prefix=colorstr('CoreML Pipeline:')):
         # YOLOv8 CoreML pipeline
         import coremltools as ct  # noqa
 
         LOGGER.info(f'{prefix} starting pipeline with coremltools {ct.__version__}...')
         batch_size, ch, h, w = list(self.im.shape)  # BCHW
 
-        # Output shapes
-        spec = model.get_spec()
-        out0, out1 = iter(spec.description.output)
-        if MACOS:
-            from PIL import Image
-            img = Image.new('RGB', (w, h))  # img(192 width, 320 height)
-            # img = torch.zeros((*opt.img_size, 3)).numpy()  # img size(320,192,3) iDetection
-            out = model.predict({'image': img})
-            out0_shape = out[out0.name].shape
-            out1_shape = out[out1.name].shape
-        else:  # linux and windows can not run model.predict(), get sizes from pytorch output y
-            out0_shape = self.output_shape[2], self.output_shape[1] - 4  # (3780, 80)
-            out1_shape = self.output_shape[2], 4  # (3780, 4)
-
-        # Checks
         names = self.metadata['names']
-        nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
-        na, nc = out0_shape
-        # na, nc = out0.type.multiArrayType.shape  # number anchors, classes
-        assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
 
-        # Define output shapes (missing)
-        out0.type.multiArrayType.shape[:] = out0_shape  # (3780, 80)
-        out1.type.multiArrayType.shape[:] = out1_shape  # (3780, 4)
-        # spec.neuralNetwork.preprocessing[0].featureName = '0'
-
-        # Flexible input shapes
-        # from coremltools.models.neural_network import flexible_shape_utils
-        # s = [] # shapes
-        # s.append(flexible_shape_utils.NeuralNetworkImageSize(320, 192))
-        # s.append(flexible_shape_utils.NeuralNetworkImageSize(640, 384))  # (height, width)
-        # flexible_shape_utils.add_enumerated_image_sizes(spec, feature_name='image', sizes=s)
-        # r = flexible_shape_utils.NeuralNetworkImageSizeRange()  # shape ranges
-        # r.add_height_range((192, 640))
-        # r.add_width_range((192, 640))
-        # flexible_shape_utils.update_image_size_range(spec, feature_name='image', size_range=r)
-
-        # Print
-        # print(spec.description)
-
-        # Model from spec
-        model = ct.models.MLModel(spec)
+        model, nx, ny, nc = self._add_output_spec_coreml(
+            model, 
+            torchmodel_outshapes=torchmodel_outshapes,
+            task=task,
+            splitted=True
+        )
+        outnames = [_o.name for _o in model._spec.description.output]
+        LOGGER.info(f"{prefix} model output is {outnames}")
+        assert outnames[0] == 'confidence', "input model 1st output must be cofinence"
+        assert outnames[1] == 'coordinates', "input model 2nd output must be coordinates"
 
         # 3. Create NMS protobuf
         nms_spec = ct.proto.Model_pb2.Model()
         nms_spec.specificationVersion = 5
+        nms_out_feature_names = ['confidence_nms', 'coordinates_nms', "selected_indices"]
         for i in range(2):
             decoder_output = model._spec.description.output[i].SerializeToString()
+            LOGGER.info(f"{prefix} {decoder_output=}")
             nms_spec.description.input.add()
             nms_spec.description.input[i].ParseFromString(decoder_output)
             nms_spec.description.output.add()
             nms_spec.description.output[i].ParseFromString(decoder_output)
+            LOGGER.info(f"{prefix} {nms_spec.description.output[i]}")
+        
+        nms_spec.description.output.add()
+        nms_spec.description.output[-1].name = nms_out_feature_names[2]
+        nms_spec.description.output[-1].type.multiArrayType.dataType = ct.proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT32
+        LOGGER.info(f"{prefix} {nms_spec.description.output[-1]}")
 
-        nms_spec.description.output[0].name = 'confidence'
-        nms_spec.description.output[1].name = 'coordinates'
+        nms_spec.description.output[0].name = nms_out_feature_names[0]
+        nms_spec.description.output[1].name = nms_out_feature_names[1]
 
         output_sizes = [nc, 4]
         for i in range(2):
@@ -897,10 +920,10 @@ class Exporter:
             del ma_type.shape[:]
 
         nms = nms_spec.nonMaximumSuppression
-        nms.confidenceInputFeatureName = out0.name  # 1x507x80
-        nms.coordinatesInputFeatureName = out1.name  # 1x507x4
-        nms.confidenceOutputFeatureName = 'confidence'
-        nms.coordinatesOutputFeatureName = 'coordinates'
+        nms.confidenceInputFeatureName = "confidence"  # 1x507x80
+        nms.coordinatesInputFeatureName = "coordinates"  # 1x507x4
+        nms.confidenceOutputFeatureName = nms_out_feature_names[0]
+        nms.coordinatesOutputFeatureName = nms_out_feature_names[1]
         nms.iouThresholdInputFeatureName = 'iouThreshold'
         nms.confidenceThresholdInputFeatureName = 'confidenceThreshold'
         nms.iouThreshold = 0.45
@@ -908,19 +931,28 @@ class Exporter:
         nms.pickTop.perClass = True
         nms.stringClassLabels.vector.extend(names.values())
         nms_model = ct.models.MLModel(nms_spec)
-
+        for _o in nms_model._spec.description.output:
+            LOGGER.info(f"nms model output: {_o}")
+        
+        LOGGER.info(f"output features: {['confidence_nms', 'coordinates_nms'] + outnames[2:] if len(outnames)>2 else []}")
         # 4. Pipeline models together
         pipeline = ct.models.pipeline.Pipeline(input_features=[('image', ct.models.datatypes.Array(3, ny, nx)),
                                                                ('iouThreshold', ct.models.datatypes.Double()),
                                                                ('confidenceThreshold', ct.models.datatypes.Double())],
-                                               output_features=['confidence', 'coordinates'])
+                                               output_features= nms_out_feature_names + outnames[2:] if len(outnames)>2 else [])
         pipeline.add_model(model)
+        LOGGER.info(f"added detect/segment model")
         pipeline.add_model(nms_model)
-
+        LOGGER.info(f"added nms model")
         # Correct datatypes
         pipeline.spec.description.input[0].ParseFromString(model._spec.description.input[0].SerializeToString())
         pipeline.spec.description.output[0].ParseFromString(nms_model._spec.description.output[0].SerializeToString())
         pipeline.spec.description.output[1].ParseFromString(nms_model._spec.description.output[1].SerializeToString())
+        pipeline.spec.description.output[2].ParseFromString(nms_model._spec.description.output[2].SerializeToString())
+        if len(pipeline.spec.description.output) == 5:
+
+            for _i, _o in enumerate(model._spec.description.output[2:]):
+                pipeline.spec.description.output[_i + 3].ParseFromString(_o.SerializeToString())
 
         # Update metadata
         pipeline.spec.specificationVersion = 5
@@ -930,12 +962,14 @@ class Exporter:
 
         # Save the model
         model = ct.models.MLModel(pipeline.spec)
-        model.input_description['image'] = 'Input image'
         model.input_description['iouThreshold'] = f'(optional) IOU threshold override (default: {nms.iouThreshold})'
         model.input_description['confidenceThreshold'] = \
             f'(optional) Confidence threshold override (default: {nms.confidenceThreshold})'
-        model.output_description['confidence'] = 'Boxes × Class confidence (see user-defined metadata "classes")'
-        model.output_description['coordinates'] = 'Boxes × [x, y, width, height] (relative to image size)'
+        for _o in model._spec.description.input:
+            LOGGER.info(f"final model input: {_o}")
+        for _o in model._spec.description.output:
+            LOGGER.info(f"final model output: {_o}")
+        
         LOGGER.info(f'{prefix} pipeline success')
         return model
 
