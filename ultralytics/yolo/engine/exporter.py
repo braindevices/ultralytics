@@ -401,11 +401,28 @@ class Exporter:
                     self.normalize = 1.0 / w  # scalar
                 else:
                     self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
-
+            
             def forward(self, x):
                 xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
                 return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
 
+        class iOSSegmentModel(torch.nn.Module):
+            # Wrap an Ultralytics YOLO model for iOS export
+            def __init__(self, model, im):
+                super().__init__()
+                b, c, h, w = im.shape  # batch, channel, height, width
+                self.model = model
+                self.nc = len(model.names)  # number of classes
+                if w == h:
+                    self.normalize = 1.0 / w  # scalar
+                else:
+                    self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
+
+            def forward(self, x):
+                xywh, cls, mask_weights = self.model(x)[0][0].transpose(0, 1).split((4, self.nc, 32), 1)
+                return cls, xywh * self.normalize, mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
+            
+        
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
         f = self.file.with_suffix('.mlmodel')
 
@@ -432,6 +449,8 @@ class Exporter:
             ct_model = ct.models.neural_network.quantization_utils.quantize_weights(ct_model, bits, mode)
         if self.args.nms and self.model.task == 'detect':
             ct_model = self._pipeline_coreml(ct_model)
+        if self.model.task == "segment":
+            ct_model = self._add_output_spec_coreml(ct_model, self.args.task, splitted=False)
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m['description']
@@ -733,6 +752,75 @@ class Exporter:
         populator.load_associated_files([str(tmp_file)])
         populator.populate()
         tmp_file.unlink()
+
+    def _add_output_spec_coreml(self, model, task: str, splitted: bool, prefix=colorstr('CoreML add output spec:')):
+        # YOLOv8 CoreML pipeline
+        output_descs = {
+            ("detect", False): [
+                ('detects', "(xywh + Class confidence) × Boxes (see user-defined metadata classes)"),
+            ],
+            ("detect", True): 
+            [
+                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")'), 
+                ('coordinates', 'Boxes × [x, y, width, height] (relative to image size)')
+            ],
+            ("segment", False): 
+            [
+                ('detects', '(xywh + Class confidence + 32) × Boxes (see user-defined metadata "classes")'),
+                ('protos', '32 × w/4 × h/4')
+            ]
+
+        }
+        
+        import coremltools as ct  # noqa
+
+        batch_size, ch, h, w = list(self.im.shape)  # BCHW
+
+        # Output shapes
+        spec = model.get_spec()
+        if MACOS:
+            from PIL import Image
+            img = Image.new('RGB', (w, h))  # img(192 width, 320 height)
+            # img = torch.zeros((*opt.img_size, 3)).numpy()  # img size(320,192,3) iDetection
+            out = model.predict({'image': img})
+            for _out in iter(spec.description.output):
+                _out.type.multiArrayType.shape[:] = out[_out.name].shape
+        else:  # linux and windows can not run model.predict(), get sizes from pytorch output y
+            for _i in range(0, len(spec.description.output)):
+                print(f"output name: {spec.description.output[_i].name}")
+                ct.utils.rename_feature(
+                    spec, 
+                    spec.description.output[_i].name,
+                    output_descs[(task, splitted)][_i][0]
+                )
+                spec.description.output[_i].type.multiArrayType.shape[:] = self.output_shape[_i]
+
+        # Checks
+        names = self.metadata['names']
+        
+        # spec.neuralNetwork.preprocessing[0].featureName = '0'
+
+        # Flexible input shapes
+        # from coremltools.models.neural_network import flexible_shape_utils
+        # s = [] # shapes
+        # s.append(flexible_shape_utils.NeuralNetworkImageSize(320, 192))
+        # s.append(flexible_shape_utils.NeuralNetworkImageSize(640, 384))  # (height, width)
+        # flexible_shape_utils.add_enumerated_image_sizes(spec, feature_name='image', sizes=s)
+        # r = flexible_shape_utils.NeuralNetworkImageSizeRange()  # shape ranges
+        # r.add_height_range((192, 640))
+        # r.add_width_range((192, 640))
+        # flexible_shape_utils.update_image_size_range(spec, feature_name='image', size_range=r)
+
+        # Print
+        # print(spec.description)
+
+        # Model from spec
+        model = ct.models.MLModel(spec)
+        model.input_description['image'] = 'Input image'
+        for _name, _desc in output_descs[(task, splitted)]:
+            model.output_description[_name] = _desc
+        LOGGER.info(f'{prefix} pipeline success')
+        return model
 
     def _pipeline_coreml(self, model, prefix=colorstr('CoreML Pipeline:')):
         # YOLOv8 CoreML pipeline
