@@ -417,7 +417,7 @@ class Exporter:
             
             def forward(self, x):
                 xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
-                return xywh * self.normalize, cls  # confidence (3780, 80), coordinates (3780, 4)
+                return torch.unsqueeze(xywh * self.normalize, 0), torch.unsqueeze(cls, 0)  # confidence (3780, 80), coordinates (3780, 4)
 
         class iOSSegmentModel(torch.nn.Module):
             # Wrap an Ultralytics YOLO model for iOS export
@@ -433,7 +433,7 @@ class Exporter:
 
             def forward(self, x):
                 xywh, cls, mask_weights = self.model(x)[0][0].transpose(0, 1).split((4, self.nc, 32), 1)
-                return xywh * self.normalize, cls, mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
+                return torch.unsqueeze(xywh * self.normalize, 0), torch.unsqueeze(cls, 0), mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
             
         
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
@@ -837,7 +837,7 @@ class Exporter:
         # Checks
         names = self.metadata['names']
         nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
-        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[1].type.multiArrayType.shape)
+        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[1].type.multiArrayType.shape[1:])
         # # na, nc = out0.type.multiArrayType.shape  # number anchors, classes
         assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
 
@@ -889,11 +889,11 @@ class Exporter:
 
         # 3. Create NMS protobuf
         nms_inputfeatures = [(_o.name, ct.models.datatypes.Array(*_o.type.multiArrayType.shape)) for _o in model._spec.description.output[:2]]
-        nms_inputfeatures += [
-            ("iou_threshold", ct.models.datatypes.Array(1,)),
-            ("score_threshold", ct.models.datatypes.Array(1,)),
-            ("max_boxes", ct.models.datatypes.Array(1,))
-        ]
+        # nms_inputfeatures += [
+        #     ("iou_threshold", ct.models.datatypes.Array(1,)),
+        #     ("score_threshold", ct.models.datatypes.Array(1,)),
+        #     ("max_boxes", ct.models.datatypes.Array(1,))
+        # ]
         nms_outputfeatures = [
             ('coordinates_nms', None),
             ('confidence_nms', None),
@@ -913,28 +913,28 @@ class Exporter:
             output_names=nms_out_feature_names,
             iou_threshold= 0.45,
             score_threshold=0.25,
-            max_boxes=model._spec.description.output[0].type.multiArrayType.shape[0],
+            max_boxes=100,
             per_class_suppression=True
         )
         
         nms_spec = builder.spec
         
-        for i in range(3):
-            nms_spec.description.input[i+2].type.multiArrayType.dataType = ct.proto.FeatureTypes_pb2.ArrayFeatureType.DOUBLE
+        # for i in range(3):
+        #     nms_spec.description.input[i+2].type.multiArrayType.dataType = ct.proto.FeatureTypes_pb2.ArrayFeatureType.DOUBLE
         
-        output_sizes = [4, nc]
+        # output_sizes = [4, nc]
 
-        for i in range(2):
-            ma_type = nms_spec.description.output[i].type.multiArrayType
-            ma_type.shapeRange.sizeRanges.add()
-            ma_type.shapeRange.sizeRanges[0].lowerBound = 0
-            ma_type.shapeRange.sizeRanges[0].upperBound = -1
-            ma_type.shapeRange.sizeRanges.add()
-            ma_type.shapeRange.sizeRanges[1].lowerBound = output_sizes[i]
-            ma_type.shapeRange.sizeRanges[1].upperBound = output_sizes[i]
-            del ma_type.shape[:]
+        # for i in range(2):
+        #     ma_type = nms_spec.description.output[i].type.multiArrayType
+        #     ma_type.shapeRange.sizeRanges.add()
+        #     ma_type.shapeRange.sizeRanges[0].lowerBound = 0
+        #     ma_type.shapeRange.sizeRanges[0].upperBound = -1
+        #     ma_type.shapeRange.sizeRanges.add()
+        #     ma_type.shapeRange.sizeRanges[1].lowerBound = output_sizes[i]
+        #     ma_type.shapeRange.sizeRanges[1].upperBound = output_sizes[i]
+        #     del ma_type.shape[:]
 
-        nms = nms_spec.nonMaximumSuppression
+        nms = builder.spec.neuralNetwork.layers[0].NonMaximumSuppression
         # nms.confidenceInputFeatureName = "confidence"  # 1x507x80
         # nms.coordinatesInputFeatureName = "coordinates"  # 1x507x4
         # nms.iouThresholdInputFeatureName = 'iouThreshold'
@@ -942,6 +942,7 @@ class Exporter:
         # nms.iouThreshold = 0.45
         # nms.confidenceThreshold = 0.25
         # nms.pickTop.perClass = True
+        # nms.maxBoxes = 10
         # nms.stringClassLabels.vector.extend(names.values())
         nms_model = ct.models.MLModel(nms_spec)
 
@@ -950,16 +951,17 @@ class Exporter:
         for _o in nms_model._spec.description.output:
             LOGGER.info(f"nms model output: {_o}")
         
-        output_features= nms_out_feature_names + outnames[2:] if len(outnames)>2 else []
+        # output_features= nms_out_feature_names + outnames[2:] if len(outnames)>2 else []
+        output_features= nms_out_feature_names + outnames
         LOGGER.info(f"output features: {output_features}")
 
         # 4. Pipeline models together
         pipeline = ct.models.pipeline.Pipeline(
             input_features=[
                 ('image', ct.models.datatypes.Array(3, ny, nx)),
-                ('iou_threshold', ct.models.datatypes.Array(1)),
-                ('score_threshold', ct.models.datatypes.Array(1)),
-                ('max_boxes', ct.models.datatypes.Array(1))
+                # ('iouThreshold', ct.models.datatypes.Double()),
+                # ('confidenceThreshold', ct.models.datatypes.Double()),
+                # ('max_boxes', ct.models.datatypes.Array(1))
             ],
             output_features= output_features
         )
@@ -972,14 +974,17 @@ class Exporter:
         for i in range(4):
             pipeline.spec.description.output[i].ParseFromString(nms_model._spec.description.output[i].SerializeToString())
         if len(pipeline.spec.description.output) == 6:
-            for _i, _o in enumerate(model._spec.description.output[2:]):
+            for _i, _o in enumerate(model._spec.description.output):
+                pipeline.spec.description.output[_i + 4].ParseFromString(_o.SerializeToString())
+        elif len(pipeline.spec.description.output) == 8:
+            for _i, _o in enumerate(model._spec.description.output):
                 pipeline.spec.description.output[_i + 4].ParseFromString(_o.SerializeToString())
 
         # Update metadata
         pipeline.spec.specificationVersion = 5
-        pipeline.spec.description.metadata.userDefined.update({
-            'IoU threshold': str(nms.iouThreshold),
-            'Confidence threshold': str(nms.confidenceThreshold)})
+        # pipeline.spec.description.metadata.userDefined.update({
+        #     'IoU threshold': str(nms.iouThreshold),
+        #     'Confidence threshold': str(nms.confidenceThreshold)})
 
         # Save the model
         model = ct.models.MLModel(pipeline.spec)
