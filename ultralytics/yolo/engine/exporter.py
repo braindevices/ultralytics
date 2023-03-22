@@ -414,6 +414,7 @@ class Exporter:
                     self.normalize = 1.0 / w  # scalar
                 else:
                     self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
+                self.split_output = True
             
             def forward(self, x):
                 xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
@@ -430,12 +431,20 @@ class Exporter:
                     self.normalize = 1.0 / w  # scalar
                 else:
                     self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
+                self.split_output = True
 
             def forward(self, x):
                 detect, protos = self.model(x)
                 xywh, cls, mask_weights = detect[0].transpose(0, 1).split((4, self.nc, 32), 1)
+                # coreML bug !!! when use unsqueeze together with splited value, in coreml, value will all become 0 !!!
+                # clone().detach(), cannot fix it, because it is noop
+                # torch.empty_like(cls).copy_(cls) failes too
+                # torch.tensor() has no effect neither
+                # contiguous is a noop
+                xywh_ = torch.empty(1, *xywh.shape)
+                xywh_[0,:,:] = xywh[:,:]
                 
-                return torch.unsqueeze(xywh * self.normalize, 0), torch.unsqueeze(cls, 0), mask_weights, protos[0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
+                return xywh_, torch.unsqueeze(cls.contiguous(), 0), mask_weights, protos[0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
             
         
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
@@ -473,7 +482,7 @@ class Exporter:
             if self.args.nms:
                 ct_model = self._pipeline_coreml(ct_model, torch_model_outshape, self.args.task)
             else:
-                ct_model = self._add_output_spec_coreml(ct_model, torch_model_outshape, self.args.task, splitted=True)[0]
+                ct_model = self._add_output_spec_coreml(ct_model, torch_model_outshape, self.args.task, splitted=getattr(model, "split_output", False))[0]
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m['description']
@@ -803,13 +812,13 @@ class Exporter:
         }
         output_get_number_of_classes = {
             ("detect", False):
-                lambda shape: shape[0] - 4,
+                lambda x: x.output[0].type.multiArrayType.shape[1:][0] - 4,
             ("detect", True): 
-                lambda shape: shape[1],
+                lambda x: x.output[1].type.multiArrayType.shape[-1],
             ("segment", False): 
-                lambda shape: shape[0] - 4 - 32,
+                lambda x: x.output[0].type.multiArrayType.shape[1:][0] - 4 - 32,
             ("segment", True): 
-                lambda shape: shape[1]
+                lambda x: x.output[1].type.multiArrayType.shape[-1]
         }
         
         import coremltools as ct  # noqa
@@ -839,7 +848,7 @@ class Exporter:
         # Checks
         names = self.metadata['names']
         nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
-        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[1].type.multiArrayType.shape[1:])
+        nc = output_get_number_of_classes[(task, splitted)](spec.description)
         # # na, nc = out0.type.multiArrayType.shape  # number anchors, classes
         assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
 
