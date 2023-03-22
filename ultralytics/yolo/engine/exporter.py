@@ -417,7 +417,7 @@ class Exporter:
             
             def forward(self, x):
                 xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
-                return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
+                return xywh * self.normalize, cls  # confidence (3780, 80), coordinates (3780, 4)
 
         class iOSSegmentModel(torch.nn.Module):
             # Wrap an Ultralytics YOLO model for iOS export
@@ -433,7 +433,7 @@ class Exporter:
 
             def forward(self, x):
                 xywh, cls, mask_weights = self.model(x)[0][0].transpose(0, 1).split((4, self.nc, 32), 1)
-                return cls, xywh * self.normalize, mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
+                return xywh * self.normalize, cls, mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
             
         
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
@@ -782,8 +782,8 @@ class Exporter:
             ],
             ("detect", True): 
             [
-                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")'), 
-                ('coordinates', 'Boxes × [x, y, width, height] (relative to image size)')
+                ('coordinates', 'Boxes × [x, y, width, height] (relative to image size)'),
+                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")')
             ],
             ("segment", False): 
             [
@@ -792,8 +792,8 @@ class Exporter:
             ],
             ("segment", True): 
             [
-                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")'), 
                 ('coordinates', 'Boxes × [x, y, width, height] (relative to image size)'),
+                ('confidence', 'Boxes × Class confidence (see user-defined metadata "classes")'), 
                 ('masks', 'Boxes × 32'),
                 ('protos', '32 × w/4 × h/4')
             ]
@@ -837,7 +837,7 @@ class Exporter:
         # Checks
         names = self.metadata['names']
         nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
-        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[0].type.multiArrayType.shape)
+        nc = output_get_number_of_classes[(task, splitted)](spec.description.output[1].type.multiArrayType.shape)
         # # na, nc = out0.type.multiArrayType.shape  # number anchors, classes
         assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
 
@@ -884,31 +884,43 @@ class Exporter:
         )
         outnames = [_o.name for _o in model._spec.description.output]
         LOGGER.info(f"{prefix} model output is {outnames}")
-        assert outnames[0] == 'confidence', "input model 1st output must be cofinence"
-        assert outnames[1] == 'coordinates', "input model 2nd output must be coordinates"
+        assert outnames[1] == 'confidence', "input model 2nd output must be cofidence"
+        assert outnames[0] == 'coordinates', "input model 1st output must be coordinates"
 
         # 3. Create NMS protobuf
-        nms_spec = ct.proto.Model_pb2.Model()
-        nms_spec.specificationVersion = 5
-        nms_out_feature_names = ['confidence_nms', 'coordinates_nms', "selected_indices"]
-        for i in range(2):
-            decoder_output = model._spec.description.output[i].SerializeToString()
-            LOGGER.info(f"{prefix} {decoder_output=}")
-            nms_spec.description.input.add()
-            nms_spec.description.input[i].ParseFromString(decoder_output)
-            nms_spec.description.output.add()
-            nms_spec.description.output[i].ParseFromString(decoder_output)
-            LOGGER.info(f"{prefix} {nms_spec.description.output[i]}")
+        nms_inputfeatures = [(_o.name, ct.models.datatypes.Array(*_o.type.multiArrayType.shape)) for _o in model._spec.description.output]
+        nms_inputfeatures += [
+            ("iou_threshold", ct.models.datatypes.Array(1,)),
+            ("score_threshold", ct.models.datatypes.Array(1,)),
+            ("max_boxes", ct.models.datatypes.Array(1,))
+        ]
+        nms_outputfeatures = [
+            ('coordinates_nms', None),
+            ('confidence_nms', None),
+            ('selected_indices', None),
+            ('selected_count', None)
+        ]
+        nms_out_feature_names = [i[0] for i in nms_outputfeatures]
+        builder = ct.models.neural_network.NeuralNetworkBuilder(
+            nms_inputfeatures,
+            nms_outputfeatures, 
+            disable_rank5_shape_mapping=True,
+            use_float_arraytype=True
+        )
+        builder.add_nms(
+            name="nms",
+            input_names=[i[0] for i in nms_inputfeatures],
+            output_names=nms_out_feature_names,
+            iou_threshold= 0.45,
+            score_threshold=0.25,
+            max_boxes=model._spec.description.output[0].type.multiArrayType.shape[0],
+            per_class_suppression=True
+        )
         
-        nms_spec.description.output.add()
-        nms_spec.description.output[-1].name = nms_out_feature_names[2]
-        nms_spec.description.output[-1].type.multiArrayType.dataType = ct.proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT32
-        LOGGER.info(f"{prefix} {nms_spec.description.output[-1]}")
+        nms_spec = builder.spec
+        
+        output_sizes = [4, nc]
 
-        nms_spec.description.output[0].name = nms_out_feature_names[0]
-        nms_spec.description.output[1].name = nms_out_feature_names[1]
-
-        output_sizes = [nc, 4]
         for i in range(2):
             ma_type = nms_spec.description.output[i].type.multiArrayType
             ma_type.shapeRange.sizeRanges.add()
@@ -920,39 +932,42 @@ class Exporter:
             del ma_type.shape[:]
 
         nms = nms_spec.nonMaximumSuppression
-        nms.confidenceInputFeatureName = "confidence"  # 1x507x80
-        nms.coordinatesInputFeatureName = "coordinates"  # 1x507x4
-        nms.confidenceOutputFeatureName = nms_out_feature_names[0]
-        nms.coordinatesOutputFeatureName = nms_out_feature_names[1]
-        nms.iouThresholdInputFeatureName = 'iouThreshold'
-        nms.confidenceThresholdInputFeatureName = 'confidenceThreshold'
-        nms.iouThreshold = 0.45
-        nms.confidenceThreshold = 0.25
-        nms.pickTop.perClass = True
-        nms.stringClassLabels.vector.extend(names.values())
+        # nms.confidenceInputFeatureName = "confidence"  # 1x507x80
+        # nms.coordinatesInputFeatureName = "coordinates"  # 1x507x4
+        # nms.iouThresholdInputFeatureName = 'iouThreshold'
+        # nms.confidenceThresholdInputFeatureName = 'confidenceThreshold'
+        # nms.iouThreshold = 0.45
+        # nms.confidenceThreshold = 0.25
+        # nms.pickTop.perClass = True
+        # nms.stringClassLabels.vector.extend(names.values())
         nms_model = ct.models.MLModel(nms_spec)
         for _o in nms_model._spec.description.output:
             LOGGER.info(f"nms model output: {_o}")
         
-        LOGGER.info(f"output features: {['confidence_nms', 'coordinates_nms'] + outnames[2:] if len(outnames)>2 else []}")
+        output_features= nms_out_feature_names + outnames[2:] if len(outnames)>2 else []
+        LOGGER.info(f"output features: {output_features}")
+
         # 4. Pipeline models together
-        pipeline = ct.models.pipeline.Pipeline(input_features=[('image', ct.models.datatypes.Array(3, ny, nx)),
-                                                               ('iouThreshold', ct.models.datatypes.Double()),
-                                                               ('confidenceThreshold', ct.models.datatypes.Double())],
-                                               output_features= nms_out_feature_names + outnames[2:] if len(outnames)>2 else [])
+        pipeline = ct.models.pipeline.Pipeline(
+            input_features=[
+                ('image', ct.models.datatypes.Array(3, ny, nx)),
+                ('iou_threshold', ct.models.datatypes.Double()),
+                ('score_threshold', ct.models.datatypes.Double()),
+                ('max_boxes', ct.models.datatypes.Int64())
+            ],
+            output_features= output_features
+        )
         pipeline.add_model(model)
         LOGGER.info(f"added detect/segment model")
         pipeline.add_model(nms_model)
         LOGGER.info(f"added nms model")
         # Correct datatypes
         pipeline.spec.description.input[0].ParseFromString(model._spec.description.input[0].SerializeToString())
-        pipeline.spec.description.output[0].ParseFromString(nms_model._spec.description.output[0].SerializeToString())
-        pipeline.spec.description.output[1].ParseFromString(nms_model._spec.description.output[1].SerializeToString())
-        pipeline.spec.description.output[2].ParseFromString(nms_model._spec.description.output[2].SerializeToString())
-        if len(pipeline.spec.description.output) == 5:
-
+        for i in range(4):
+            pipeline.spec.description.output[i].ParseFromString(nms_model._spec.description.output[i].SerializeToString())
+        if len(pipeline.spec.description.output) == 6:
             for _i, _o in enumerate(model._spec.description.output[2:]):
-                pipeline.spec.description.output[_i + 3].ParseFromString(_o.SerializeToString())
+                pipeline.spec.description.output[_i + 4].ParseFromString(_o.SerializeToString())
 
         # Update metadata
         pipeline.spec.specificationVersion = 5
@@ -962,9 +977,9 @@ class Exporter:
 
         # Save the model
         model = ct.models.MLModel(pipeline.spec)
-        model.input_description['iouThreshold'] = f'(optional) IOU threshold override (default: {nms.iouThreshold})'
-        model.input_description['confidenceThreshold'] = \
-            f'(optional) Confidence threshold override (default: {nms.confidenceThreshold})'
+        # model.input_description['iouThreshold'] = f'(optional) IOU threshold override (default: {nms.iouThreshold})'
+        # model.input_description['confidenceThreshold'] = \
+        #     f'(optional) Confidence threshold override (default: {nms.confidenceThreshold})'
         for _o in model._spec.description.input:
             LOGGER.info(f"final model input: {_o}")
         for _o in model._spec.description.output:
