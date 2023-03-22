@@ -432,8 +432,10 @@ class Exporter:
                     self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
 
             def forward(self, x):
-                xywh, cls, mask_weights = self.model(x)[0][0].transpose(0, 1).split((4, self.nc, 32), 1)
-                return torch.unsqueeze(xywh * self.normalize, 0), torch.unsqueeze(cls, 0), mask_weights, self.model(x)[1][0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
+                detect, protos = self.model(x)
+                xywh, cls, mask_weights = detect[0].transpose(0, 1).split((4, self.nc, 32), 1)
+                
+                return torch.unsqueeze(xywh * self.normalize, 0), torch.unsqueeze(cls, 0), mask_weights, protos[0]  # confidence (3780, 80), coordinates (3780, 4), (3780, 32), (32, h, w)
             
         
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
@@ -454,7 +456,7 @@ class Exporter:
             torch_model_outshape = self.get_model_output_shape(model)
         elif self.model.task == 'segment':
             # TODO CoreML Segmentation model pipelining
-            model = iOSSegmentModel(self.model, self.im) if self.args.nms else self.model
+            model = iOSSegmentModel(self.model, self.im)
             torch_model_outshape = self.get_model_output_shape(model)
 
 
@@ -471,7 +473,7 @@ class Exporter:
             if self.args.nms:
                 ct_model = self._pipeline_coreml(ct_model, torch_model_outshape, self.args.task)
             else:
-                ct_model = self._add_output_spec_coreml(ct_model, torch_model_outshape, self.args.task, splitted=False)[0]
+                ct_model = self._add_output_spec_coreml(ct_model, torch_model_outshape, self.args.task, splitted=True)[0]
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m['description']
@@ -974,7 +976,7 @@ class Exporter:
         for i in range(4):
             pipeline.spec.description.output[i].ParseFromString(nms_model._spec.description.output[i].SerializeToString())
         if len(pipeline.spec.description.output) == 6:
-            for _i, _o in enumerate(model._spec.description.output):
+            for _i, _o in enumerate(model._spec.description.output[2:]):
                 pipeline.spec.description.output[_i + 4].ParseFromString(_o.SerializeToString())
         elif len(pipeline.spec.description.output) == 8:
             for _i, _o in enumerate(model._spec.description.output):
