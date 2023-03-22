@@ -888,7 +888,7 @@ class Exporter:
         assert outnames[0] == 'coordinates', "input model 1st output must be coordinates"
 
         # 3. Create NMS protobuf
-        nms_inputfeatures = [(_o.name, ct.models.datatypes.Array(*_o.type.multiArrayType.shape)) for _o in model._spec.description.output]
+        nms_inputfeatures = [(_o.name, ct.models.datatypes.Array(*_o.type.multiArrayType.shape)) for _o in model._spec.description.output[:2]]
         nms_inputfeatures += [
             ("iou_threshold", ct.models.datatypes.Array(1,)),
             ("score_threshold", ct.models.datatypes.Array(1,)),
@@ -919,6 +919,9 @@ class Exporter:
         
         nms_spec = builder.spec
         
+        for i in range(3):
+            nms_spec.description.input[i+2].type.multiArrayType.dataType = ct.proto.FeatureTypes_pb2.ArrayFeatureType.DOUBLE
+        
         output_sizes = [4, nc]
 
         for i in range(2):
@@ -941,6 +944,9 @@ class Exporter:
         # nms.pickTop.perClass = True
         # nms.stringClassLabels.vector.extend(names.values())
         nms_model = ct.models.MLModel(nms_spec)
+
+        for _o in nms_model._spec.description.input:
+            LOGGER.info(f"nms model input: {_o}")
         for _o in nms_model._spec.description.output:
             LOGGER.info(f"nms model output: {_o}")
         
@@ -951,9 +957,9 @@ class Exporter:
         pipeline = ct.models.pipeline.Pipeline(
             input_features=[
                 ('image', ct.models.datatypes.Array(3, ny, nx)),
-                ('iou_threshold', ct.models.datatypes.Double()),
-                ('score_threshold', ct.models.datatypes.Double()),
-                ('max_boxes', ct.models.datatypes.Int64())
+                ('iou_threshold', ct.models.datatypes.Array(1)),
+                ('score_threshold', ct.models.datatypes.Array(1)),
+                ('max_boxes', ct.models.datatypes.Array(1))
             ],
             output_features= output_features
         )
